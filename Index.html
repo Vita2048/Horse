@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Model Viewer - Three.js</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #222;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            pointer-events: auto;
+            min-width: 250px;
+            backdrop-filter: blur(5px);
+            border: 1px solid #444;
+        }
+
+        h1 {
+            margin: 0 0 15px 0;
+            font-size: 1.2rem;
+            color: #ff9d00;
+        }
+
+        .control-group {
+            margin-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            font-size: 0.9rem;
+            color: #ccc;
+        }
+
+        button {
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background 0.2s;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #555;
+        }
+
+        button.active {
+            background: #ff9d00;
+            color: #000;
+            border-color: #ff9d00;
+        }
+
+        .instructions {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 15px;
+            font-style: italic;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.5rem;
+            pointer-events: none;
+        }
+
+        .key-hint {
+            color: #ff9d00;
+            font-weight: bold;
+        }
+
+        #error-msg {
+            color: #ff4444;
+            display: none;
+            font-size: 0.9rem;
+            margin-top: 10px;
+        }
+    </style>
+    <!-- Import Maps for Three.js modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+
+<body>
+    <div id="ui-panel">
+        <h1>Rigged Model Viewer</h1>
+
+        <div class="control-group">
+            <button id="btn-toggle-anim" class="active">Animation: ACTIVE</button>
+            <button id="btn-pose-mode">Mode: View</button>
+            <label for="speedSlider">Speed</label>
+            <input type="range" id="speedSlider" min="0.1" max="2" step="0.1" value="0.2">
+            <button id="btn-export">Export GLTF</button>
+        </div>
+        <div class="control-group">
+            <label>Actions:</label>
+            <button id="btn-lie-down">Lie Down</button>
+            <button id="btn-stand-up">Stand Up</button>
+            <button id="btn-kick">Kick</button>
+        </div>
+        <div id="instruction-text" class="instructions">Scroll to zoom.</div>
+    </div>
+    <div id="error-msg"></div>
+
+    <div id="loading">Loading scene.gltf...</div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        let characterRoot, skeletonHelper, mixer;
+        let actions = {};
+        let currentState = 'IDLE';
+        function fadeToAction(name, duration) {
+            if (actions[currentState]) {
+                actions[currentState].fadeOut(duration);
+            }
+            if (actions[name]) {
+                actions[name].reset().fadeIn(duration).play();
+            }
+            currentState = name;
+        }
+
+        let animationRunning = true;
+        let poseMode = false;
+        let speed = 0.2;
+        let clock = new THREE.Clock();
+        const mouse = new THREE.Vector2();
+        const raycaster = new THREE.Raycaster();
+        const keys = {};
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+        scene.fog = new THREE.Fog(0x222222, 10, 50);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 5, 10);
+
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 2;
+        controls.maxDistance = 50;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.1;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        scene.add(dirLight);
+
+        // Floor
+        const gridHelper = new THREE.GridHelper(200, 200, 0x444444, 0x333333);
+        scene.add(gridHelper);
+
+        const planeGeo = new THREE.PlaneGeometry(200, 200);
+
+        const planeMat = new THREE.MeshStandardMaterial({
+            color: 0x1a1a1a, roughness: 1
+        });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.rotation.x = -Math.PI / 2;
+        plane.receiveShadow = true;
+        scene.add(plane);
+
+        // --- Model Setup ---
+
+        const modelContainer = new THREE.Group();
+
+        const transformControl = new TransformControls(camera, renderer.domElement);
+
+        transformControl.addEventListener('dragging-changed', function (event) {
+            controls.enabled = !event.value;
+        });
+        scene.add(transformControl);
+
+        const loader = new GLTFLoader();
+
+        loader.load('scene.gltf', function (gltf) {
+            characterRoot = gltf.scene;
+            modelContainer.add(characterRoot);
+            scene.add(modelContainer);
+
+            // Setup skeleton helper
+            characterRoot.traverse(function (child) {
+                if (child.isSkinnedMesh) {
+                    skeletonHelper = new THREE.SkeletonHelper(child);
+                    skeletonHelper.visible = false;
+                    scene.add(skeletonHelper);
+                }
+            });
+
+            // Setup animation mixer
+            if (gltf.animations.length > 0) {
+                mixer = new THREE.AnimationMixer(characterRoot);
+
+                console.log("Animations found:", gltf.animations.map(a => a.name));
+
+                // Helper to find clip
+                const findClip = (terms) => {
+                    if (!Array.isArray(terms)) terms = [terms];
+                    return gltf.animations.find(clip => terms.some(term => clip.name.toLowerCase().includes(term.toLowerCase())));
+                };
+
+                // Map animations to standard names
+                const idleClip = findClip(["idle", "stand", "wait"]);
+                const walkClip = findClip(["walk", "run", "trot"]);
+                const lieClip = findClip(["lie", "sleep", "rest", "down"]);
+                const kickClip = findClip(["kick", "attack", "fight"]);
+
+                // Create actions
+                if (idleClip) actions['idle'] = mixer.clipAction(idleClip);
+                if (walkClip) actions['walk'] = mixer.clipAction(walkClip);
+                if (lieClip) actions['lie_down'] = mixer.clipAction(lieClip);
+                if (kickClip) actions['kick'] = mixer.clipAction(kickClip);
+
+                // Fallbacks
+                if (!actions['idle'] && gltf.animations.length > 0) actions['idle'] = mixer.clipAction(gltf.animations[0]);
+                if (!actions['walk'] && actions['idle']) actions['walk'] = actions['idle']; // Worst case fallback
+
+                // Start Idle
+                if (actions['idle']) {
+                    actions['idle'].play();
+                    currentState = 'IDLE';
+                }
+            }
+
+            // Hide loading
+            document.getElementById('loading').style.display = 'none';
+        }, undefined, function (error) {
+            console.error(error);
+            document.getElementById('error-msg').innerText = 'Failed to load scene.gltf';
+            document.getElementById('error-msg').style.display = 'block';
+        });
+
+        function onMouseClick(event) {
+            if (!characterRoot || !poseMode) return;
+
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersects = raycaster.intersectObjects(characterRoot.children, true);
+
+            if (intersects.length > 0) {
+                const target = intersects[0].object;
+                transformControl.attach(target);
+            } else {
+                transformControl.detach();
+            }
+        }
+
+        window.addEventListener('mousedown', onMouseClick);
+        window.addEventListener('resize', onWindowResize, false);
+        window.addEventListener('keydown', (e) => keys[e.code] = true);
+        window.addEventListener('keyup', (e) => keys[e.code] = false);
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- UI Logic ---
+
+        const btnToggleAnim = document.getElementById('btn-toggle-anim');
+        const btnPoseMode = document.getElementById('btn-pose-mode');
+        const btnExport = document.getElementById('btn-export');
+        const speedSlider = document.getElementById('speedSlider');
+        const instructions = document.getElementById('instruction-text');
+
+        // New Action Buttons
+        const btnLieDown = document.getElementById('btn-lie-down');
+        const btnStandUp = document.getElementById('btn-stand-up');
+        const btnKick = document.getElementById('btn-kick');
+
+        if (btnToggleAnim) {
+            btnToggleAnim.addEventListener('click', () => {
+                animationRunning = !animationRunning;
+                btnToggleAnim.classList.toggle('active');
+                btnToggleAnim.innerText = animationRunning ? "Animation: ACTIVE" : "Animation: PAUSED";
+
+                if (animationRunning && poseMode) {
+                    transformControl.detach();
+                }
+            });
+        }
+
+        if (speedSlider) {
+            speedSlider.addEventListener('input', (e) => {
+                speed = parseFloat(e.target.value);
+            });
+        }
+
+        if (btnPoseMode) {
+            btnPoseMode.addEventListener('click', () => {
+                poseMode = !poseMode;
+
+                if (poseMode) {
+                    // Pause animation for posing
+                    animationRunning = false;
+                    btnToggleAnim.classList.remove('active');
+                    btnToggleAnim.innerText = "Animation: PAUSED";
+
+                    btnPoseMode.innerText = "Mode: Pose";
+                    btnPoseMode.classList.add('active');
+                    transformControl.setMode('rotate');
+                    instructions.innerHTML = "Click model parts to rotate.<br>Animation paused.";
+
+                    // Show skeleton for visual aid
+                    if (skeletonHelper) skeletonHelper.visible = true;
+
+                } else {
+                    poseMode = false;
+                    animationRunning = true;
+                    btnToggleAnim.classList.add('active');
+                    btnToggleAnim.innerText = "Animation: ACTIVE";
+
+                    btnPoseMode.innerText = "Mode: View";
+                    btnPoseMode.classList.remove('active');
+                    transformControl.detach();
+                    instructions.innerHTML = "<span class='key-hint'>W A S D</span> to move & steer.<br>Drag to rotate camera.";
+
+                    if (skeletonHelper) skeletonHelper.visible = false;
+                }
+            });
+        }
+
+        // Action Button Listeners
+        if (btnLieDown) {
+            btnLieDown.addEventListener('click', () => {
+                if (poseMode || currentState === 'LIE_DOWN') return;
+
+                if (actions['lie_down']) {
+                    fadeToAction('lie_down', 0.5);
+                    currentState = 'LIE_DOWN';
+                } else {
+                    console.warn("Lie Down animation not found");
+                }
+            });
+        }
+
+        if (btnStandUp) {
+            btnStandUp.addEventListener('click', () => {
+                if (poseMode || currentState !== 'LIE_DOWN') return;
+
+                fadeToAction('idle', 0.5);
+                currentState = 'IDLE';
+            });
+        }
+
+        if (btnKick) {
+            btnKick.addEventListener('click', () => {
+                if (poseMode || currentState === 'LIE_DOWN') return;
+
+                if (actions['kick']) {
+                    const kickAction = actions['kick'];
+
+                    // Play kick once
+                    kickAction.reset();
+                    kickAction.setLoop(THREE.LoopOnce);
+                    kickAction.clampWhenFinished = true;
+
+                    fadeToAction('kick', 0.1);
+                    currentState = 'KICK';
+
+                    // Listen for finish
+                    const onKickFinished = (e) => {
+                        if (e.action === kickAction) {
+                            mixer.removeEventListener('finished', onKickFinished);
+                            // Return to idle
+                            fadeToAction('idle', 0.2);
+                            currentState = 'IDLE';
+                        }
+                    };
+                    mixer.addEventListener('finished', onKickFinished);
+                } else {
+                    console.warn("Kick animation not found");
+                }
+            });
+        }
+
+        if (btnExport) {
+            btnExport.addEventListener('click', () => {
+                const exporter = new GLTFExporter();
+
+                // Hide helpers
+                if (skeletonHelper) skeletonHelper.visible = false;
+                transformControl.detach();
+
+                exporter.parse(modelContainer,
+                    function (gltf) {
+                        const output = JSON.stringify(gltf, null, 2);
+
+                        const blob = new Blob([output], {
+                            type: 'text/plain'
+                        });
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.style.display = 'none';
+                        link.href = url;
+                        link.download = 'modified_scene.gltf';
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+
+                        // Restore state
+                        if (poseMode && skeletonHelper) skeletonHelper.visible = true;
+                    },
+                    function (error) {
+                        console.error('An error happened during export:', error);
+                    },
+                    {
+                        binary: false
+                    });
+            });
+        }
+
+        // --- Camera Follow Logic ---
+        const cameraOffset = new THREE.Vector3(0, 5, 10);
+        const targetPosition = new THREE.Vector3();
+
+        function updateCamera() {
+            if (!poseMode && animationRunning) {
+                targetPosition.copy(modelContainer.position);
+                // Smoothly move orbit controls target
+                controls.target.lerp(targetPosition, 0.1);
+            }
+        }
+
+        function updateLogic(delta) {
+            if (mixer && animationRunning) {
+                mixer.update(delta);
+            }
+
+            if (!characterRoot || poseMode) return;
+
+            // Handle Actions (Lie Down / Kick) blocking movement
+            if (currentState === 'LIE_DOWN') {
+                return;
+            }
+
+            if (currentState === 'KICK') {
+                return;
+            }
+
+            // WASD Movement
+            let moveX = 0,
+                moveZ = 0;
+            if (keys['KeyW']) moveZ -= 1;
+            if (keys['KeyS']) moveZ += 1;
+            if (keys['KeyA']) moveX -= 1;
+            if (keys['KeyD']) moveX += 1;
+
+            const isMoving = (moveX !== 0 || moveZ !== 0);
+
+            if (isMoving) {
+                // Calculate direction
+                const direction = new THREE.Vector3(moveX, 0, moveZ).normalize();
+
+                // Move
+                modelContainer.position.add(direction.multiplyScalar(speed));
+
+                // Rotate
+                const angle = Math.atan2(direction.x, direction.z);
+                modelContainer.rotation.y = angle;
+
+                // Switch to Walk Animation
+                if (currentState !== 'WALK') {
+                    fadeToAction('walk', 0.2);
+                    currentState = 'WALK';
+                }
+            } else {
+
+                // Stop Moving -> Switch to Idle
+                if (currentState !== 'IDLE') {
+                    fadeToAction('idle', 0.2);
+                    currentState = 'IDLE';
+                }
+            }
+        }
+
+        // --- Main Loop ---
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            updateLogic(delta);
+            updateCamera();
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+    </script>
+</body>
+
+</html>
