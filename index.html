@@ -119,16 +119,29 @@
             <button id="btn-toggle-anim" class="active">Animation: ACTIVE</button>
             <button id="btn-pose-mode">Mode: View</button>
             <label for="speedSlider">Speed</label>
-            <input type="range" id="speedSlider" min="0.1" max="2" step="0.1" value="0.2">
+            <input type="range" id="speedSlider" min="0.1" max="5" step="0.1" value="1.0">
             <button id="btn-export">Export GLTF</button>
         </div>
+
+        <div class="control-group">
+            <label>Movement:</label>
+            <button id="btn-walk-fwd">Walk Forward</button>
+            <button id="btn-walk-bwd">Walk Backward</button>
+            <button id="btn-gallop">Gallop Forward</button>
+            <button id="btn-stop" style="background: #822; border-color: #a44;">STOP</button>
+        </div>
+
         <div class="control-group">
             <label>Actions:</label>
             <button id="btn-lie-down">Lie Down</button>
-            <button id="btn-stand-up">Stand Up</button>
+            <button id="btn-stand-up" disabled style="opacity: 0.5; cursor: not-allowed;">Stand Up</button>
+            <button id="btn-prance">Prance</button>
             <button id="btn-kick">Kick</button>
+            <button id="btn-shake-lr">Shake Head L/R</button>
+            <button id="btn-shake-up">Shake Head Up</button>
         </div>
         <div id="instruction-text" class="instructions">Scroll to zoom.</div>
+        <div id="debug-time" style="margin-top: 10px; font-family: monospace; color: #0f0;">Time: 0.00s</div>
     </div>
     <div id="error-msg"></div>
 
@@ -141,24 +154,44 @@
         import { TransformControls } from 'three/addons/controls/TransformControls.js';
         import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 
+        // --- Configuration ---
+        // Ranges in SECONDS. We will convert to frames.
+        const ANIMATION_RANGES_SEC = {
+            idle: { start: 0, end: 22 },
+            walk_forward: { start: 29, end: 31 },
+            walk_backward: { start: 31, end: 33 },
+            gallop_forward: { start: 33, end: 35 },
+            lie_down: { start: 38, end: 41 },
+            stand_up: { start: 41, end: 42 },
+            prance: { start: 42, end: 43 },
+            kick: { start: 43, end: 45 },
+            shake_head_lr: { start: 45, end: 47 },
+            shake_head_up: { start: 47, end: 49 }
+        };
+
+        const MOVEMENT_SPEEDS = {
+            walk_forward: 1.5,
+            walk_backward: -0.8,
+            gallop_forward: 5.0,
+            idle: 0
+        };
+
+        const FPS = 30; // Assumed FPS for the clip
+
+        // --- State ---
         let characterRoot, skeletonHelper, mixer;
         let actions = {};
-        let currentState = 'IDLE';
-        function fadeToAction(name, duration) {
-            if (actions[currentState]) {
-                actions[currentState].fadeOut(duration);
-            }
-            if (actions[name]) {
-                actions[name].reset().fadeIn(duration).play();
-            }
-            currentState = name;
-        }
-
+        let currentState = 'idle';
         let animationRunning = true;
         let poseMode = false;
-        let speed = 0.2;
-        let clock = new THREE.Clock();
+        let speedMultiplier = 1.0;
+        let lastInputTime = Date.now();
+        let isRandomActionPlaying = false;
+        let isLyingDown = false;
+
+        const clock = new THREE.Clock();
         const mouse = new THREE.Vector2();
         const raycaster = new THREE.Raycaster();
         const keys = {};
@@ -172,9 +205,7 @@
         const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
         camera.position.set(0, 5, 10);
 
-        const renderer = new THREE.WebGLRenderer({
-            antialias: true
-        });
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.shadowMap.enabled = true;
         renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -195,12 +226,6 @@
         dirLight.castShadow = true;
         dirLight.shadow.mapSize.width = 2048;
         dirLight.shadow.mapSize.height = 2048;
-        dirLight.shadow.camera.near = 0.1;
-        dirLight.shadow.camera.far = 50;
-        dirLight.shadow.camera.left = -20;
-        dirLight.shadow.camera.right = 20;
-        dirLight.shadow.camera.top = 20;
-        dirLight.shadow.camera.bottom = -20;
         scene.add(dirLight);
 
         // Floor
@@ -208,24 +233,16 @@
         scene.add(gridHelper);
 
         const planeGeo = new THREE.PlaneGeometry(200, 200);
-
-        const planeMat = new THREE.MeshStandardMaterial({
-            color: 0x1a1a1a, roughness: 1
-        });
+        const planeMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1 });
         const plane = new THREE.Mesh(planeGeo, planeMat);
         plane.rotation.x = -Math.PI / 2;
         plane.receiveShadow = true;
         scene.add(plane);
 
         // --- Model Setup ---
-
         const modelContainer = new THREE.Group();
-
         const transformControl = new TransformControls(camera, renderer.domElement);
-
-        transformControl.addEventListener('dragging-changed', function (event) {
-            controls.enabled = !event.value;
-        });
+        transformControl.addEventListener('dragging-changed', (event) => controls.enabled = !event.value);
         scene.add(transformControl);
 
         const loader = new GLTFLoader();
@@ -235,7 +252,6 @@
             modelContainer.add(characterRoot);
             scene.add(modelContainer);
 
-            // Setup skeleton helper
             characterRoot.traverse(function (child) {
                 if (child.isSkinnedMesh) {
                     skeletonHelper = new THREE.SkeletonHelper(child);
@@ -244,42 +260,38 @@
                 }
             });
 
-            // Setup animation mixer
             if (gltf.animations.length > 0) {
                 mixer = new THREE.AnimationMixer(characterRoot);
+                const masterClip = gltf.animations[0]; // Assuming single "Animations" clip
 
-                console.log("Animations found:", gltf.animations.map(a => a.name));
+                // Create sub-clips
+                for (const [name, range] of Object.entries(ANIMATION_RANGES_SEC)) {
+                    // Convert seconds to frames
+                    const startFrame = Math.floor(range.start * FPS);
+                    const endFrame = Math.floor(range.end * FPS);
 
-                // Helper to find clip
-                const findClip = (terms) => {
-                    if (!Array.isArray(terms)) terms = [terms];
-                    return gltf.animations.find(clip => terms.some(term => clip.name.toLowerCase().includes(term.toLowerCase())));
-                };
+                    const subClip = THREE.AnimationUtils.subclip(masterClip, name, startFrame, endFrame, FPS);
+                    const action = mixer.clipAction(subClip);
 
-                // Map animations to standard names
-                const idleClip = findClip(["idle", "stand", "wait"]);
-                const walkClip = findClip(["walk", "run", "trot"]);
-                const lieClip = findClip(["lie", "sleep", "rest", "down"]);
-                const kickClip = findClip(["kick", "attack", "fight"]);
+                    // Configure loop modes
+                    if (['lie_down', 'stand_up', 'kick', 'shake_head_lr', 'shake_head_up', 'prance'].includes(name)) {
+                        action.setLoop(THREE.LoopOnce);
+                        action.clampWhenFinished = true;
+                    } else {
+                        action.setLoop(THREE.LoopRepeat);
+                    }
 
-                // Create actions
-                if (idleClip) actions['idle'] = mixer.clipAction(idleClip);
-                if (walkClip) actions['walk'] = mixer.clipAction(walkClip);
-                if (lieClip) actions['lie_down'] = mixer.clipAction(lieClip);
-                if (kickClip) actions['kick'] = mixer.clipAction(kickClip);
+                    actions[name] = action;
+                }
 
-                // Fallbacks
-                if (!actions['idle'] && gltf.animations.length > 0) actions['idle'] = mixer.clipAction(gltf.animations[0]);
-                if (!actions['walk'] && actions['idle']) actions['walk'] = actions['idle']; // Worst case fallback
+                // Create a special "idle_lying" action which is just the last frame of lie_down
+                // We can just pause the lie_down action at the end, but having a loop is safer if we want breathing etc.
+                // For now, clamping lie_down is enough.
 
                 // Start Idle
-                if (actions['idle']) {
-                    actions['idle'].play();
-                    currentState = 'IDLE';
-                }
+                playAction('idle', 0.5);
             }
 
-            // Hide loading
             document.getElementById('loading').style.display = 'none';
         }, undefined, function (error) {
             console.error(error);
@@ -287,20 +299,90 @@
             document.getElementById('error-msg').style.display = 'block';
         });
 
+        // --- Animation Control ---
+        function playAction(name, fadeDuration = 0.2) {
+            if (!actions[name]) {
+                console.warn(`Animation ${name} not found`);
+                return;
+            }
+            if (currentState === name && actions[name].isRunning()) return;
+
+            const prevAction = actions[currentState];
+            const newAction = actions[name];
+
+            if (prevAction && prevAction !== newAction) {
+                prevAction.fadeOut(fadeDuration);
+            }
+
+            newAction.reset().fadeIn(fadeDuration).play();
+            currentState = name;
+            lastInputTime = Date.now();
+
+            updateUI();
+        }
+
+        function updateUI() {
+            // Update active button state
+            document.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            const btnId = 'btn-' + currentState.replace(/_/g, '-');
+            const btn = document.getElementById(btnId);
+            if (btn) btn.classList.add('active');
+
+            // Enable/Disable buttons based on isLyingDown
+            const btnLieDown = document.getElementById('btn-lie-down');
+            const btnStandUp = document.getElementById('btn-stand-up');
+            const movementButtons = [
+                'btn-walk-fwd', 'btn-walk-bwd', 'btn-gallop',
+                'btn-prance', 'btn-kick', 'btn-shake-lr', 'btn-shake-up'
+            ];
+
+            if (isLyingDown) {
+                btnLieDown.disabled = true;
+                btnLieDown.style.opacity = '0.5';
+                btnLieDown.style.cursor = 'not-allowed';
+
+                btnStandUp.disabled = false;
+                btnStandUp.style.opacity = '1';
+                btnStandUp.style.cursor = 'pointer';
+
+                movementButtons.forEach(id => {
+                    const b = document.getElementById(id);
+                    if (b) {
+                        b.disabled = true;
+                        b.style.opacity = '0.5';
+                        b.style.cursor = 'not-allowed';
+                    }
+                });
+            } else {
+                btnLieDown.disabled = false;
+                btnLieDown.style.opacity = '1';
+                btnLieDown.style.cursor = 'pointer';
+
+                btnStandUp.disabled = true;
+                btnStandUp.style.opacity = '0.5';
+                btnStandUp.style.cursor = 'not-allowed';
+
+                movementButtons.forEach(id => {
+                    const b = document.getElementById(id);
+                    if (b) {
+                        b.disabled = false;
+                        b.style.opacity = '1';
+                        b.style.cursor = 'pointer';
+                    }
+                });
+            }
+        }
+
+        // --- Interaction ---
         function onMouseClick(event) {
             if (!characterRoot || !poseMode) return;
-
             const rect = renderer.domElement.getBoundingClientRect();
             mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
             mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
             raycaster.setFromCamera(mouse, camera);
-
             const intersects = raycaster.intersectObjects(characterRoot.children, true);
-
             if (intersects.length > 0) {
-                const target = intersects[0].object;
-                transformControl.attach(target);
+                transformControl.attach(intersects[0].object);
             } else {
                 transformControl.detach();
             }
@@ -308,7 +390,10 @@
 
         window.addEventListener('mousedown', onMouseClick);
         window.addEventListener('resize', onWindowResize, false);
-        window.addEventListener('keydown', (e) => keys[e.code] = true);
+        window.addEventListener('keydown', (e) => {
+            keys[e.code] = true;
+            lastInputTime = Date.now();
+        });
         window.addEventListener('keyup', (e) => keys[e.code] = false);
 
         function onWindowResize() {
@@ -318,120 +403,101 @@
         }
 
         // --- UI Logic ---
-
         const btnToggleAnim = document.getElementById('btn-toggle-anim');
         const btnPoseMode = document.getElementById('btn-pose-mode');
         const btnExport = document.getElementById('btn-export');
         const speedSlider = document.getElementById('speedSlider');
-        const instructions = document.getElementById('instruction-text');
+        const debugTime = document.getElementById('debug-time');
 
-        // New Action Buttons
-        const btnLieDown = document.getElementById('btn-lie-down');
-        const btnStandUp = document.getElementById('btn-stand-up');
-        const btnKick = document.getElementById('btn-kick');
+        // Map buttons to actions
+        const buttonMap = {
+            'btn-walk-fwd': 'walk_forward',
+            'btn-walk-bwd': 'walk_backward',
+            'btn-gallop': 'gallop_forward',
+            'btn-lie-down': 'lie_down',
+            'btn-stand-up': 'stand_up',
+            'btn-prance': 'prance',
+            'btn-kick': 'kick',
+            'btn-shake-lr': 'shake_head_lr',
+            'btn-shake-up': 'shake_head_up'
+        };
+
+        Object.entries(buttonMap).forEach(([btnId, actionName]) => {
+            const btn = document.getElementById(btnId);
+            if (btn) {
+                btn.addEventListener('click', () => {
+                    if (poseMode) return;
+                    if (isLyingDown && actionName !== 'stand_up') return;
+                    if (!isLyingDown && actionName === 'stand_up') return;
+
+                    playAction(actionName);
+
+                    // Handle One-Shot Actions
+                    if (['lie_down', 'stand_up', 'kick', 'shake_head_lr', 'shake_head_up', 'prance'].includes(actionName)) {
+                        isRandomActionPlaying = true;
+                        const action = actions[actionName];
+
+                        const onFinished = (e) => {
+                            if (e.action === action) {
+                                mixer.removeEventListener('finished', onFinished);
+                                isRandomActionPlaying = false;
+
+                                if (actionName === 'lie_down') {
+                                    isLyingDown = true;
+                                    updateUI();
+                                    // Stay in lie_down state (clamped)
+                                } else if (actionName === 'stand_up') {
+                                    isLyingDown = false;
+                                    updateUI();
+                                    playAction('idle');
+                                } else {
+                                    playAction('idle');
+                                }
+                            }
+                        };
+                        mixer.addEventListener('finished', onFinished);
+                    }
+                });
+            }
+        });
+
+        document.getElementById('btn-stop').addEventListener('click', () => {
+            if (isLyingDown) return; // Can't stop to idle if lying down (must stand up first)
+            playAction('idle');
+        });
 
         if (btnToggleAnim) {
             btnToggleAnim.addEventListener('click', () => {
                 animationRunning = !animationRunning;
                 btnToggleAnim.classList.toggle('active');
                 btnToggleAnim.innerText = animationRunning ? "Animation: ACTIVE" : "Animation: PAUSED";
-
-                if (animationRunning && poseMode) {
-                    transformControl.detach();
-                }
             });
         }
 
         if (speedSlider) {
             speedSlider.addEventListener('input', (e) => {
-                speed = parseFloat(e.target.value);
+                speedMultiplier = parseFloat(e.target.value);
             });
         }
 
         if (btnPoseMode) {
             btnPoseMode.addEventListener('click', () => {
                 poseMode = !poseMode;
-
                 if (poseMode) {
-                    // Pause animation for posing
                     animationRunning = false;
-                    btnToggleAnim.classList.remove('active');
                     btnToggleAnim.innerText = "Animation: PAUSED";
-
                     btnPoseMode.innerText = "Mode: Pose";
                     btnPoseMode.classList.add('active');
                     transformControl.setMode('rotate');
-                    instructions.innerHTML = "Click model parts to rotate.<br>Animation paused.";
-
-                    // Show skeleton for visual aid
                     if (skeletonHelper) skeletonHelper.visible = true;
-
                 } else {
                     poseMode = false;
                     animationRunning = true;
-                    btnToggleAnim.classList.add('active');
                     btnToggleAnim.innerText = "Animation: ACTIVE";
-
                     btnPoseMode.innerText = "Mode: View";
                     btnPoseMode.classList.remove('active');
                     transformControl.detach();
-                    instructions.innerHTML = "<span class='key-hint'>W A S D</span> to move & steer.<br>Drag to rotate camera.";
-
                     if (skeletonHelper) skeletonHelper.visible = false;
-                }
-            });
-        }
-
-        // Action Button Listeners
-        if (btnLieDown) {
-            btnLieDown.addEventListener('click', () => {
-                if (poseMode || currentState === 'LIE_DOWN') return;
-
-                if (actions['lie_down']) {
-                    fadeToAction('lie_down', 0.5);
-                    currentState = 'LIE_DOWN';
-                } else {
-                    console.warn("Lie Down animation not found");
-                }
-            });
-        }
-
-        if (btnStandUp) {
-            btnStandUp.addEventListener('click', () => {
-                if (poseMode || currentState !== 'LIE_DOWN') return;
-
-                fadeToAction('idle', 0.5);
-                currentState = 'IDLE';
-            });
-        }
-
-        if (btnKick) {
-            btnKick.addEventListener('click', () => {
-                if (poseMode || currentState === 'LIE_DOWN') return;
-
-                if (actions['kick']) {
-                    const kickAction = actions['kick'];
-
-                    // Play kick once
-                    kickAction.reset();
-                    kickAction.setLoop(THREE.LoopOnce);
-                    kickAction.clampWhenFinished = true;
-
-                    fadeToAction('kick', 0.1);
-                    currentState = 'KICK';
-
-                    // Listen for finish
-                    const onKickFinished = (e) => {
-                        if (e.action === kickAction) {
-                            mixer.removeEventListener('finished', onKickFinished);
-                            // Return to idle
-                            fadeToAction('idle', 0.2);
-                            currentState = 'IDLE';
-                        }
-                    };
-                    mixer.addEventListener('finished', onKickFinished);
-                } else {
-                    console.warn("Kick animation not found");
                 }
             });
         }
@@ -439,70 +505,87 @@
         if (btnExport) {
             btnExport.addEventListener('click', () => {
                 const exporter = new GLTFExporter();
-
-                // Hide helpers
                 if (skeletonHelper) skeletonHelper.visible = false;
                 transformControl.detach();
-
-                exporter.parse(modelContainer,
-                    function (gltf) {
-                        const output = JSON.stringify(gltf, null, 2);
-
-                        const blob = new Blob([output], {
-                            type: 'text/plain'
-                        });
-                        const url = URL.createObjectURL(blob);
-                        const link = document.createElement('a');
-                        link.style.display = 'none';
-                        link.href = url;
-                        link.download = 'modified_scene.gltf';
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-
-                        // Restore state
-                        if (poseMode && skeletonHelper) skeletonHelper.visible = true;
-                    },
-                    function (error) {
-                        console.error('An error happened during export:', error);
-                    },
-                    {
-                        binary: false
-                    });
+                exporter.parse(modelContainer, function (gltf) {
+                    const output = JSON.stringify(gltf, null, 2);
+                    const blob = new Blob([output], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'modified_scene.gltf';
+                    link.click();
+                    if (poseMode && skeletonHelper) skeletonHelper.visible = true;
+                }, { binary: false });
             });
         }
 
-        // --- Camera Follow Logic ---
-        const cameraOffset = new THREE.Vector3(0, 5, 10);
+        // --- Camera Follow & Logic ---
         const targetPosition = new THREE.Vector3();
-
-        function updateCamera() {
-            if (!poseMode && animationRunning) {
-                targetPosition.copy(modelContainer.position);
-                // Smoothly move orbit controls target
-                controls.target.lerp(targetPosition, 0.1);
-            }
-        }
 
         function updateLogic(delta) {
             if (mixer && animationRunning) {
                 mixer.update(delta);
+                // Debug Time
+                if (actions[currentState]) {
+                    const range = ANIMATION_RANGES_SEC[currentState];
+                    if (range) {
+                        // Approximate global time
+                        const currentGlobalTime = range.start + actions[currentState].time;
+                        debugTime.innerText = `Anim: ${currentState} | Time: ${currentGlobalTime.toFixed(2)}s`;
+                    }
+                }
             }
 
             if (!characterRoot || poseMode) return;
 
-            // Handle Actions (Lie Down / Kick) blocking movement
-            if (currentState === 'LIE_DOWN') {
-                return;
+            // Idle Logic
+            if (currentState === 'idle' && !isRandomActionPlaying && !isLyingDown) {
+                if (Date.now() - lastInputTime > 5000) { // 5 seconds inactivity
+                    // Pick random action
+                    const randomActions = ['shake_head_lr', 'shake_head_up', 'prance', 'kick', 'lie_down'];
+                    const nextAction = randomActions[Math.floor(Math.random() * randomActions.length)];
+
+                    console.log("Triggering random idle action:", nextAction);
+                    playAction(nextAction);
+                    isRandomActionPlaying = true;
+
+                    const action = actions[nextAction];
+                    const onFinished = (e) => {
+                        if (e.action === action) {
+                            mixer.removeEventListener('finished', onFinished);
+                            isRandomActionPlaying = false;
+
+                            if (nextAction === 'lie_down') {
+                                isLyingDown = true;
+                                updateUI();
+                                // Immediately stand up for random idle loop
+                                playAction('stand_up');
+                                isRandomActionPlaying = true;
+                                const onStandFinished = (e2) => {
+                                    if (e2.action === actions['stand_up']) {
+                                        mixer.removeEventListener('finished', onStandFinished);
+                                        isRandomActionPlaying = false;
+                                        isLyingDown = false;
+                                        updateUI();
+                                        playAction('idle');
+                                    }
+                                };
+                                mixer.addEventListener('finished', onStandFinished);
+                            } else {
+                                playAction('idle');
+                            }
+                        }
+                    };
+                    mixer.addEventListener('finished', onFinished);
+                    lastInputTime = Date.now(); // Reset timer
+                }
             }
 
-            if (currentState === 'KICK') {
-                return;
-            }
+            // Movement Logic (WASD)
+            if (isLyingDown) return; // No movement if lying down
 
-            // WASD Movement
-            let moveX = 0,
-                moveZ = 0;
+            let moveX = 0, moveZ = 0;
             if (keys['KeyW']) moveZ -= 1;
             if (keys['KeyS']) moveZ += 1;
             if (keys['KeyA']) moveX -= 1;
@@ -510,46 +593,60 @@
 
             const isMoving = (moveX !== 0 || moveZ !== 0);
 
-            if (isMoving) {
-                // Calculate direction
-                const direction = new THREE.Vector3(moveX, 0, moveZ).normalize();
+            if (isMoving && !isRandomActionPlaying) {
+                let targetAnim = 'walk_forward';
+                if (moveZ > 0) targetAnim = 'walk_backward';
 
-                // Move
-                modelContainer.position.add(direction.multiplyScalar(speed));
-
-                // Rotate
-                const angle = Math.atan2(direction.x, direction.z);
-                modelContainer.rotation.y = angle;
-
-                // Switch to Walk Animation
-                if (currentState !== 'WALK') {
-                    fadeToAction('walk', 0.2);
-                    currentState = 'WALK';
+                if (currentState !== targetAnim && currentState !== 'gallop_forward') {
+                    playAction(targetAnim);
                 }
-            } else {
 
-                // Stop Moving -> Switch to Idle
-                if (currentState !== 'IDLE') {
-                    fadeToAction('idle', 0.2);
-                    currentState = 'IDLE';
+                // Rotation
+                if (keys['KeyA']) {
+                    modelContainer.rotation.y += 2.0 * delta;
                 }
+                if (keys['KeyD']) {
+                    modelContainer.rotation.y -= 2.0 * delta;
+                }
+
+                // Movement
+                if (keys['KeyW']) {
+                    modelContainer.translateZ(MOVEMENT_SPEEDS.walk_forward * delta * speedMultiplier);
+                } else if (keys['KeyS']) {
+                    modelContainer.translateZ(Math.abs(MOVEMENT_SPEEDS.walk_backward) * delta * speedMultiplier);
+                }
+
+            } else if (!isMoving && !isRandomActionPlaying && ['walk_forward', 'walk_backward', 'gallop_forward'].includes(currentState)) {
+                // Stopped moving keys -> Idle
+                playAction('idle');
+            }
+
+            // Button triggered movement
+            if (['walk_forward', 'gallop_forward'].includes(currentState) && !isMoving) {
+                const speed = MOVEMENT_SPEEDS[currentState];
+                modelContainer.translateZ(speed * delta * speedMultiplier * 0.05);
+            } else if (currentState === 'walk_backward' && !isMoving) {
+                const speed = MOVEMENT_SPEEDS[currentState];
+                modelContainer.translateZ(speed * delta * speedMultiplier * 0.05);
             }
         }
 
-        // --- Main Loop ---
-
         function animate() {
             requestAnimationFrame(animate);
-
             const delta = clock.getDelta();
             updateLogic(delta);
-            updateCamera();
+
+            // Camera Follow
+            if (!poseMode && animationRunning) {
+                targetPosition.copy(modelContainer.position);
+                controls.target.lerp(targetPosition, 0.1);
+            }
+
             controls.update();
             renderer.render(scene, camera);
         }
 
         animate();
-
     </script>
 </body>
 
